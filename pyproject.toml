@@ -1,0 +1,21 @@
+[project]
+name = "dbcutoff"
+version = "0.1.0"
+description = "Comparaison des performances de plusieurs bases de données"
+authors = [
+    {name = "Thierry HUET",email = "thierry.huet@aperto-nota.fr"}
+]
+readme = "README.md"
+requires-python = ">=3.14,<4.0"
+dependencies = [
+    "psycopg (>=3.3.3,<4.0.0)",
+    "plotly (>=6.6.0,<7.0.0)",
+    "streamlit (>=1.55.0,<2.0.0)",
+    "pandas (>=2.0,<3.0)",
+    "python-dotenv (>=1.2.2,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
