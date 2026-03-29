@@ -30,6 +30,21 @@ COLORS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Traduction des noms d'opérations internes → libellés affichés
+# ---------------------------------------------------------------------------
+LABELS_OPERATIONS = {
+    "write_bulk":            "Écriture en lot",
+    "write_row_by_row":      "Écriture ligne par ligne",
+    "read_full":             "Lecture complète (sans index)",
+    "read_filtered":         "Lecture filtrée (sans index)",
+    "read_full_indexed":     "Lecture complète (avec index)",
+    "read_filtered_indexed": "Lecture filtrée (avec index)",
+}
+
+def label_op(code: str) -> str:
+    return LABELS_OPERATIONS.get(code, code)
+
+# ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
 init_storage()
@@ -59,9 +74,13 @@ if df_all.empty:
 if selected_run_id:
     df_all = df_all[df_all["run_id"] == selected_run_id]
 
-# Filtres opérations
-all_ops = sorted(df_all["operation"].unique())
-selected_ops = st.sidebar.multiselect("Opérations", all_ops, default=all_ops)
+# Filtres opérations — libellés français affichés, codes utilisés en interne
+all_ops_codes = sorted(df_all["operation"].unique())
+all_ops_labels = [label_op(op) for op in all_ops_codes]
+label_to_code = dict(zip(all_ops_labels, all_ops_codes))
+
+selected_ops_labels = st.sidebar.multiselect("Opérations", all_ops_labels, default=all_ops_labels)
+selected_ops = [label_to_code[l] for l in selected_ops_labels]
 
 # Filtres bases
 all_dbs = sorted(df_all["db_name"].unique())
@@ -105,7 +124,7 @@ color_map: dict[str, str] = {}
 c_idx = 0
 
 for (db, op), grp in df_agg.groupby(["db_name", "operation"]):
-    key = f"{db} · {op}"
+    key = f"{db} · {label_op(op)}"
     if key not in color_map:
         color_map[key] = COLORS[c_idx % len(COLORS)]
         c_idx += 1
@@ -121,7 +140,7 @@ for (db, op), grp in df_agg.groupby(["db_name", "operation"]):
         marker=dict(size=6),
         hovertemplate=(
             f"<b>{key}</b><br>"
-            "Volume : %{x:,}<br>"
+            "Volume : %{x:,} lignes<br>"
             "Durée (médiane) : %{y:.3f} s<extra></extra>"
         ),
     ))
@@ -162,7 +181,7 @@ if not df_read.empty:
 
     for (db, op), grp in df_read.groupby(["db_name", "operation"]):
         dash = "dash" if "indexed" in op else "solid"
-        key = f"{db} · {op}"
+        key = f"{db} · {label_op(op)}"
         color = COLORS[c_idx2 % len(COLORS)]
         c_idx2 += 1
 
@@ -174,6 +193,11 @@ if not df_read.empty:
             name=key,
             line=dict(color=color, dash=dash, width=2),
             marker=dict(size=6),
+            hovertemplate=(
+                f"<b>{key}</b><br>"
+                "Volume : %{x:,} lignes<br>"
+                "Durée (médiane) : %{y:.3f} s<extra></extra>"
+            ),
         ))
 
     fig2.update_layout(
@@ -190,9 +214,9 @@ else:
     st.info("Aucune opération de lecture disponible dans les filtres actuels.")
 
 # ---------------------------------------------------------------------------
-# Graphe : écriture bulk vs ligne par ligne
+# Graphe : écriture en lot vs ligne par ligne
 # ---------------------------------------------------------------------------
-st.subheader("Écriture : bulk vs ligne par ligne")
+st.subheader("Écriture : en lot vs ligne par ligne")
 
 df_write = df_agg[df_agg["operation"].str.startswith("write_")].copy()
 
@@ -209,9 +233,14 @@ if not df_write.empty:
             x=grp_sorted["volume"],
             y=grp_sorted["duration_med"],
             mode="lines+markers",
-            name=f"{db} · {op}",
+            name=f"{db} · {label_op(op)}",
             line=dict(color=color, dash=dash, width=2),
             marker=dict(size=6),
+            hovertemplate=(
+                f"<b>{db} · {label_op(op)}</b><br>"
+                "Volume : %{x:,} lignes<br>"
+                "Durée (médiane) : %{y:.3f} s<extra></extra>"
+            ),
         ))
 
     fig3.update_layout(
@@ -224,16 +253,28 @@ if not df_write.empty:
         font=dict(family="Avenir, Helvetica Neue, sans-serif", color="#222"),
     )
     st.plotly_chart(fig3, use_container_width=True)
+else:
+    st.info("Aucune opération d'écriture disponible dans les filtres actuels.")
 
 # ---------------------------------------------------------------------------
 # Tableau récapitulatif
 # ---------------------------------------------------------------------------
 st.subheader("Données brutes (médiane)")
 
+df_tableau = df_agg.copy()
+df_tableau["operation"] = df_tableau["operation"].map(label_op)
+df_tableau = df_tableau.rename(columns={
+    "db_name":      "Base de données",
+    "operation":    "Opération",
+    "indexed":      "Indexé",
+    "volume":       "Volume (lignes)",
+    "duration_med": "Durée médiane (s)",
+    "n":            "Nb mesures",
+})
+
 st.dataframe(
-    df_agg.sort_values(["db_name", "operation", "volume"]).style.format(
-        {"duration_med": "{:.4f}", "volume": "{:,}"}
-    ),
+    df_tableau.sort_values(["Base de données", "Opération", "Volume (lignes)"])
+    .style.format({"Durée médiane (s)": "{:.4f}", "Volume (lignes)": "{:,}"}),
     use_container_width=True,
     hide_index=True,
 )
@@ -241,7 +282,7 @@ st.dataframe(
 # ---------------------------------------------------------------------------
 # Téléchargement CSV
 # ---------------------------------------------------------------------------
-csv = df_agg.to_csv(index=False).encode("utf-8")
+csv = df_tableau.to_csv(index=False).encode("utf-8")
 st.download_button(
     "⬇️  Exporter les résultats (CSV)",
     data=csv,

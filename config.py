@@ -49,8 +49,21 @@ DATABASES = [
         ),
     },
     # Futurs connecteurs :
-    # { "name": "duckdb",    "module": "connectors.duckdb",    "enabled": False, "dsn": "cutoff.duckdb" },
-    # { "name": "mongodb",   "module": "connectors.mongodb",   "enabled": False, "dsn": "mongodb://localhost:27017" },
+    {
+        "name": "duckdb",
+        "module": "connectors.duckdb",
+        "enabled": True,
+        "dsn": os.environ.get("DUCKDB_DSN", str(BASE_DIR / "data" / "cutoff.duckdb")),
+    },
+    {
+        "name": "mongodb",
+        "module": "connectors.mongodb",
+        "enabled": True,
+        "dsn": os.environ.get(
+            "MONGODB_DSN",
+            "mongodb://localhost:27017/db_cutoff",
+        ),
+    },
     # { "name": "neo4j",     "module": "connectors.neo4j",     "enabled": False, "dsn": "bolt://localhost:7687" },
     # { "name": "cassandra", "module": "connectors.cassandra", "enabled": False, "dsn": "localhost" },
 ]
