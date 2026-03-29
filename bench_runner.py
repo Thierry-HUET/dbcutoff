@@ -156,6 +156,15 @@ def run_benchmark(
             for vol in vols_to_test:
                 df_sample = df_max.head(vol)
 
+                # Pour les opérations de lecture, s'assurer que la table
+                # contient exactement `vol` lignes avant chaque mesure.
+                # Les opérations d'écriture gèrent elles-mêmes leur truncate.
+                if not op["needs_data"]:
+                    log.info(
+                        "  [rechargement] %d lignes pour lectures…", vol
+                    )
+                    connector.write_bulk(df_sample)
+
                 for rep in range(1, repetitions + 1):
                     log.info(
                         "  %-30s | vol=%7d | rep=%d",
