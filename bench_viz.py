@@ -105,7 +105,7 @@ df_agg = (
 # Header
 # ---------------------------------------------------------------------------
 st.title("📊 DB Cutoff Analyzer")
-st.caption("Identification visuelle du point de rupture des bases de données — source INSEE")
+st.markdown("""> <small>Identification visuelle du point de rupture des bases de données  \n©️ APERTO-NOTA - 04/2026 - [Thierry HUET](mailto:thierry.huet@aperto-nota.fr)</small>""", unsafe_allow_html=True)
 
 col1, col2, col3 = st.columns(3)
 col1.metric("Mesures totales", len(df))

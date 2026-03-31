@@ -28,9 +28,12 @@ from connectors.base import DBConnector
 
 log = logging.getLogger(__name__)
 
-TABLE      = "insee_etablissements"
-INDEX_COL  = "siret"
-FILTER_VAL = "A"   # etat_administratif = 'A' (actif)
+TABLE            = "insee_etablissements"
+INDEX_COL        = "siret"               # index pour lookup par identifiant
+INDEX_FILTER_COL = "etat_administratif"  # index pour accélérer les lectures filtrées
+FILTER_VAL       = "F"                   # etat_administratif = 'F' (fermé)
+# 'F' est la valeur MINORITAIRE — haute sélectivité, l'index est rentable
+# 'A' (actif, majoritaire) déclencherait un scan complet même avec index
 
 COLS = (
     "siret",
@@ -128,12 +131,26 @@ class DuckDBConnector(DBConnector):
     # ------------------------------------------------------------------
 
     def _drop_index(self) -> None:
+        """Supprime tous les index de benchmark."""
         self._conn.execute(f"DROP INDEX IF EXISTS idx_{TABLE}_{INDEX_COL}")
+        self._conn.execute(f"DROP INDEX IF EXISTS idx_{TABLE}_{INDEX_FILTER_COL}")
 
     def _create_index(self) -> None:
+        """
+        Crée deux index :
+        - idx sur siret               → lookup par identifiant
+        - idx sur etat_administratif  → filtre sur valeur minoritaire (F)
+        Note : DuckDB est colonnaire — les index ont moins d'impact que sur
+        PostgreSQL car le moteur utilise ses propres statistiques de zone.
+        L'écart avec/sans index peut rester faible sur ce type de requête.
+        """
         self._conn.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{TABLE}_{INDEX_COL}"
             f" ON {TABLE}({INDEX_COL})"
+        )
+        self._conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{TABLE}_{INDEX_FILTER_COL}"
+            f" ON {TABLE}({INDEX_FILTER_COL})"
         )
 
     def _truncate(self) -> None:

@@ -6,14 +6,13 @@ import sqlite3
 import json
 import datetime
 from pathlib import Path
-from typing import Any
 
 from config import STORAGE_DB
 
 
 def _get_conn() -> sqlite3.Connection:
     STORAGE_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(STORAGE_DB), check_same_thread=False)
+    conn = sqlite3.connect(str(STORAGE_DB))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -24,22 +23,22 @@ def init_storage() -> None:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS bench_run (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id      TEXT NOT NULL,          -- UUID de la session
+                run_id      TEXT NOT NULL,
                 db_name     TEXT NOT NULL,
                 started_at  TEXT NOT NULL,
                 ended_at    TEXT,
-                status      TEXT DEFAULT 'running', -- running | done | error
-                config_json TEXT                    -- JSON des paramètres utilisés
+                status      TEXT DEFAULT 'running',
+                config_json TEXT
             );
 
             CREATE TABLE IF NOT EXISTS bench_result (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id      TEXT NOT NULL,
                 db_name     TEXT NOT NULL,
-                operation   TEXT NOT NULL,  -- write_bulk | write_row | read_full | read_filtered | ...
-                indexed     INTEGER NOT NULL DEFAULT 0,  -- 0 ou 1
+                operation   TEXT NOT NULL,
+                indexed     INTEGER NOT NULL DEFAULT 0,
                 volume      INTEGER NOT NULL,
-                batch_size  INTEGER,                     -- NULL si non applicable
+                batch_size  INTEGER,
                 duration_s  REAL NOT NULL,
                 repetition  INTEGER NOT NULL DEFAULT 1,
                 measured_at TEXT NOT NULL

@@ -21,9 +21,9 @@ INSEE_FILE = os.environ.get(
 )
 
 # --- Benchmark ---
-VOLUMES         = [1, 3, 10, 32, 100, 316, 1_000, 3_160, 10_000, 31_600, 100_000, 316_000, 1_000_000, 3_160_000,10_000_000,31_160_000,100_000_000]
-BATCH_SIZES     = [100, 1_000, 10_000, 100_000, 1_000_000,10_000_000]
-REPETITIONS     = 3
+VOLUMES         = [10, 32, 100, 316, 1_000, 3_160, 10_000, 31_600, 100_000, 316_000, 1_000_000, 3_160_000,10_000_000,31_160_000,100_000_000]
+BATCH_SIZES     = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000]
+REPETITIONS     = 5
 TIMEOUT_SECONDS = 300
 
 # --- Colonnes retenues du fichier INSEE ---
@@ -36,6 +36,8 @@ INSEE_COLUMNS = [
     "activitePrincipaleEtablissement",    # code NAF/APE
     "caractereEmployeurEtablissement",    # O=employeur, N=non-employeur
 ]
+
+#Primal7-Scaling1-Imperial5-Ferocity7-Relearn3-Donated9-Refill3
 
 # --- Bases de données disponibles ---
 DATABASES = [
@@ -64,6 +66,15 @@ DATABASES = [
             "mongodb://localhost:27017/db_cutoff",
         ),
     },
+    {
+        "name": "mysql",
+        "module": "connectors.mysql",
+        "enabled": True,
+        "dsn": os.environ.get(
+            "MYSQL_DSN",
+            "mysql+pymysql://root@localhost:3306/db_cutoff",
+        ),
+    }
     # { "name": "neo4j",     "module": "connectors.neo4j",     "enabled": False, "dsn": "bolt://localhost:7687" },
     # { "name": "cassandra", "module": "connectors.cassandra", "enabled": False, "dsn": "localhost" },
 ]

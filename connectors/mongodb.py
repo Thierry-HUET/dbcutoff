@@ -12,7 +12,7 @@ Spécificités MongoDB vs SQL :
       (désactive l'ordre pour maximiser le parallélisme interne)
     - write_row_by_row(): insert_one() en boucle
     - Pas d'index par défaut sur siret — benchmarké avec/sans
-    - Filtre : find({'etat_administratif': 'A'})
+    - Filtre : find({'etat_administratif': 'F'})  # valeur minoritaire, haute sélectivité
     - DSN format : mongodb://utilisateur:mdp@host:27017
       La base cible est extraite du DSN ou définie par MONGODB_DB
 """
@@ -29,12 +29,30 @@ from connectors.base import DBConnector
 
 log = logging.getLogger(__name__)
 
-COLLECTION  = "insee_etablissements"
-INDEX_COL   = "siret"
-FILTER_VAL  = "A"   # etat_administratif = 'A' (actif)
+COLLECTION       = "insee_etablissements"
+INDEX_COL        = "siret"               # index pour lookup par identifiant
+INDEX_FILTER_COL = "etat_administratif"  # index pour accélérer les lectures filtrées
+FILTER_VAL       = "F"                   # etat_administratif = 'F' (fermé)
+# 'F' est la valeur MINORITAIRE — haute sélectivité, l'index est rentable
+# 'A' (actif, majoritaire) → MongoDB ferait un collection scan même avec index
 
 # Nom de la base par défaut si absent du DSN
 DEFAULT_DB  = "db_cutoff"
+
+
+def _client_kwargs(dsn: str) -> dict:
+    """
+    Retourne les kwargs communs à tous les MongoClient du connecteur.
+
+    directConnection=True : force la connexion directe au nœud sans
+    passer par la découverte de topology. Nécessaire quand MongoDB tourne
+    en mode Replica Set sur une instance locale (server_type: RSGhost) —
+    pymongo ne peut pas élire de Primary sans ce paramètre.
+    Peut être désactivé via MONGODB_DIRECT_CONNECTION=false dans .env.
+    """
+    import os
+    direct = os.environ.get("MONGODB_DIRECT_CONNECTION", "true").lower() != "false"
+    return {"directConnection": direct}
 
 
 def _db_name(dsn: str) -> str:
@@ -73,7 +91,11 @@ class MongoDBConnector(DBConnector):
         MongoDB crée la base et la collection implicitement au premier insert.
         On vérifie simplement que le serveur est joignable.
         """
-        client = MongoClient(_server_dsn(self.dsn), serverSelectionTimeoutMS=5_000)
+        client = MongoClient(
+            _server_dsn(self.dsn),
+            serverSelectionTimeoutMS=5_000,
+            **_client_kwargs(self.dsn),
+        )
         try:
             client.admin.command("ping")
             existing = client.list_database_names()
@@ -88,7 +110,11 @@ class MongoDBConnector(DBConnector):
             client.close()
 
     def connect(self) -> None:
-        self._client = MongoClient(self.dsn, serverSelectionTimeoutMS=10_000)
+        self._client = MongoClient(
+            self.dsn,
+            serverSelectionTimeoutMS=10_000,
+            **_client_kwargs(self.dsn),
+        )
         self._db  = self._client[self._db_name]
         self._col = self._db[COLLECTION]
         log.info("MongoDB connecté : %s / %s", self.dsn, self._db_name)
@@ -116,7 +142,11 @@ class MongoDBConnector(DBConnector):
         """Supprime la base entière via le client."""
         if self._client is None:
             # Ouvrir une connexion temporaire pour le DROP
-            client = MongoClient(self.dsn, serverSelectionTimeoutMS=5_000)
+            client = MongoClient(
+                self.dsn,
+                serverSelectionTimeoutMS=5_000,
+                **_client_kwargs(self.dsn),
+            )
             try:
                 client.drop_database(self._db_name)
                 log.info("MongoDB : base '%s' supprimée.", self._db_name)
@@ -131,13 +161,26 @@ class MongoDBConnector(DBConnector):
     # ------------------------------------------------------------------
 
     def _drop_index(self) -> None:
-        try:
-            self._col.drop_index(f"{INDEX_COL}_1")
-        except Exception:
-            pass  # Index absent — pas d'erreur
+        """Supprime tous les index de benchmark."""
+        for idx in [f"{INDEX_COL}_1", f"{INDEX_FILTER_COL}_1"]:
+            try:
+                self._col.drop_index(idx)
+            except Exception:
+                pass  # Index absent — pas d'erreur
 
     def _create_index(self) -> None:
+        """
+        Crée deux index :
+        - idx sur siret               → lookup par identifiant
+        - idx sur etat_administratif  → filtre sur valeur minoritaire (F)
+        MongoDB utilise l'index si la sélectivité est suffisante ;
+        sur 'F' (minoritaire), le gain sera visible dès ~50k documents.
+        """
         self._col.create_index([(INDEX_COL, ASCENDING)], name=f"{INDEX_COL}_1")
+        self._col.create_index(
+            [(INDEX_FILTER_COL, ASCENDING)],
+            name=f"{INDEX_FILTER_COL}_1",
+        )
 
     def _truncate(self) -> None:
         self._col.delete_many({})
@@ -146,14 +189,32 @@ class MongoDBConnector(DBConnector):
     def _df_to_docs(df: pd.DataFrame) -> list[dict]:
         """
         Convertit un DataFrame en liste de documents MongoDB.
-        NaN/NaT → None ; les dates restent en objet date Python
-        (pymongo les sérialise en ISODate automatiquement).
+
+        Conversions appliquées (ordre important) :
+        1. None                → None
+        2. pd.NaT / NaN        → None  (testé EN PREMIER — NaT est instance de
+                                         datetime et planterait sur utcoffset())
+        3. datetime.date seul  → datetime.datetime minuit (BSON n'accepte pas date)
+        4. Autres valeurs      → inchangées
         """
+        import datetime as dt
         docs = []
         for row in df.itertuples(index=False):
             doc = {}
             for field, val in zip(df.columns, row):
-                doc[field] = None if pd.isna(val) else val
+                # 1. None explicite
+                if val is None:
+                    doc[field] = None
+                # 2. NaT / NaN — DOIT être testé avant isinstance(date/datetime)
+                #    car pd.NaT est instance de datetime et lève ValueError sur utcoffset()
+                elif pd.isna(val):
+                    doc[field] = None
+                # 3. datetime.date (pas datetime) → datetime.datetime
+                elif isinstance(val, dt.date) and not isinstance(val, dt.datetime):
+                    doc[field] = dt.datetime(val.year, val.month, val.day)
+                # 4. Valeur valide — passage direct
+                else:
+                    doc[field] = val
             docs.append(doc)
         return docs
 
