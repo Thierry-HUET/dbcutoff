@@ -103,7 +103,15 @@ class PostgresConnector(DBConnector):
             self._conn.close()
 
     def setup(self) -> None:
-        """Recrée la table cible (DROP + CREATE) en autocommit."""
+        """
+        Recrée la table cible (DROP + CREATE) en autocommit.
+
+        L'autovacuum est désactivé sur la table de benchmark :
+        - Nos DELETE FROM génèrent des tuples morts → autovacuum se déclenche
+          pendant les mesures et consomme I/O/CPU, polluant les temps mesurés
+        - La désactivation est locale à la table (pas au serveur entier)
+        - L'autovacuum est restauré automatiquement à la suppression de la table
+        """
         ddl = f"""
         CREATE TABLE IF NOT EXISTS {TABLE} (
             siret               VARCHAR(14),
@@ -121,10 +129,21 @@ class PostgresConnector(DBConnector):
             with self._conn.cursor() as cur:
                 cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
                 cur.execute(ddl)
+                # Désactiver l'autovacuum sur la table de benchmark uniquement
+                cur.execute(
+                    f"ALTER TABLE {TABLE} "
+                    f"SET (autovacuum_enabled = false, "
+                    f"toast.autovacuum_enabled = false)"
+                )
+            log.info("Autovacuum désactivé sur '%s'.", TABLE)
         finally:
             self._conn.autocommit = False
 
     def teardown(self) -> None:
+        """
+        Supprime la table de benchmark.
+        L'autovacuum est automatiquement restauré à la suppression.
+        """
         self._conn.commit()
         self._conn.autocommit = True
         try:
@@ -302,28 +321,90 @@ class PostgresConnector(DBConnector):
     has_vector_support = True
     VECTOR_TABLE = "insee_vecteurs"
 
+    def _check_pgvector(self) -> bool:
+        """
+        Vérifie si pgvector est disponible sur ce serveur PostgreSQL.
+
+        Deux niveaux de disponibilité :
+        1. Extension déjà activée dans la base courante (pg_extension)
+           → disponible immédiatement
+        2. Extension installée sur le serveur mais pas encore activée (pg_available_extensions)
+           → on peut faire CREATE EXTENSION
+        3. Extension absente du système
+           → impossible à activer, benchmark vectoriel ignoré avec message explicite
+
+        Retourne True si pgvector est utilisable, False sinon.
+        """
+        with self._conn.cursor() as cur:
+            # Cas 1 : déjà activée dans la base courante
+            cur.execute(
+                "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
+            )
+            if cur.fetchone():
+                log.info("pgvector : extension déjà activée dans la base.")
+                return True
+
+            # Cas 2 : installée sur le serveur mais pas encore activée
+            cur.execute(
+                "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'"
+            )
+            if cur.fetchone():
+                log.info("pgvector : extension disponible — activation en cours…")
+                return True
+
+        # Cas 3 : absente du système
+        log.warning(
+            "pgvector non disponible sur ce serveur PostgreSQL.\n"
+            "  → macOS  : brew install pgvector\n"
+            "  → Debian : apt install postgresql-pgvector\n"
+            "  → Docker : utiliser pgvector/pgvector comme image de base\n"
+            "Le benchmark vectoriel sera ignoré."
+        )
+        return False
+
     def vector_setup(self) -> None:
         """
-        Active l'extension pgvector et crée la table vectorielle.
-        La table contient : siret (clé), embedding (vecteur VECTOR_DIM).
+        Vérifie la disponibilité de pgvector, active l'extension si nécessaire
+        et crée la table vectorielle.
+
+        Désactive également l'autovacuum sur la table vectorielle
+        (même raison que pour la table principale).
+
+        Lève RuntimeError si pgvector est absent du système — le bench_runner
+        attrape cette exception et ignore le benchmark vectoriel proprement.
         """
         self._conn.commit()
         self._conn.autocommit = True
         try:
+            # Vérification disponibilité pgvector
+            if not self._check_pgvector():
+                raise RuntimeError(
+                    "pgvector absent — benchmark vectoriel ignoré pour PostgreSQL."
+                )
+
             with self._conn.cursor() as cur:
-                # Extension pgvector — silencieux si déjà installée
+                # Activer l'extension (CREATE IF NOT EXISTS = no-op si déjà active)
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
                 cur.execute(f"DROP TABLE IF EXISTS {self.VECTOR_TABLE}")
                 cur.execute(f"""
                     CREATE TABLE {self.VECTOR_TABLE} (
-                        id      SERIAL PRIMARY KEY,
-                        siret   VARCHAR(14),
+                        id        SERIAL PRIMARY KEY,
+                        siret     VARCHAR(14),
                         embedding vector({self.VECTOR_DIM})
                     )
                 """)
+                # Désactiver l'autovacuum — les rechargements répétés
+                # génèrent des tuples morts qui polluent les mesures
+                cur.execute(
+                    f"ALTER TABLE {self.VECTOR_TABLE} "
+                    f"SET (autovacuum_enabled = false)"
+                )
         finally:
             self._conn.autocommit = False
-        log.info("pgvector : table '%s' créée (dim=%d).", self.VECTOR_TABLE, self.VECTOR_DIM)
+        log.info(
+            "pgvector : extension activée, table '%s' créée (dim=%d, autovacuum=off).",
+            self.VECTOR_TABLE, self.VECTOR_DIM,
+        )
 
     def vector_teardown(self) -> None:
         self._conn.commit()
