@@ -21,10 +21,10 @@ INSEE_FILE = os.environ.get(
 )
 
 # --- Benchmark ---
-VOLUMES         = [10, 32, 100, 316, 1_000, 3_160, 10_000, 31_600, 100_000, 316_000, 1_000_000, 3_160_000,10_000_000,31_160_000,100_000_000]
+VOLUMES         = [ 1_000, 3_160, 10_000, 31_600, 100_000, 316_000, 1_000_000, 3_160_000,10_000_000,31_160_000,100_000_000]
 BATCH_SIZES     = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000]
-REPETITIONS     = 5
-TIMEOUT_SECONDS = 300
+REPETITIONS     = 3
+TIMEOUT_SECONDS = 600
 
 # --- Colonnes retenues du fichier INSEE ---
 INSEE_COLUMNS = [
@@ -37,7 +37,7 @@ INSEE_COLUMNS = [
     "caractereEmployeurEtablissement",    # O=employeur, N=non-employeur
 ]
 
-#Primal7-Scaling1-Imperial5-Ferocity7-Relearn3-Donated9-Refill3
+
 
 # --- Bases de données disponibles ---
 DATABASES = [
@@ -73,6 +73,15 @@ DATABASES = [
         "dsn": os.environ.get(
             "MYSQL_DSN",
             "mysql+pymysql://root@localhost:3306/db_cutoff",
+        ),
+    },
+    {
+        "name": "couchdb",
+        "module": "connectors.couchdb",
+        "enabled": True,
+        "dsn": os.environ.get(
+            "COUCHDB_DSN",
+            "http://admin:admin@localhost:5984/db_cutoff",
         ),
     }
     # { "name": "neo4j",     "module": "connectors.neo4j",     "enabled": False, "dsn": "bolt://localhost:7687" },

@@ -3,6 +3,7 @@ connectors/base.py — Interface abstraite pour tous les connecteurs DB
 """
 
 from abc import ABC, abstractmethod
+import numpy as np
 import pandas as pd
 
 
@@ -19,9 +20,20 @@ class DBConnector(ABC):
         5. teardown()         — supprime la table / collection
         6. disconnect()       — ferme la connexion
         7. drop_database()    — supprime la base entière (nettoyage final)
+
+    Opérations vectorielles (optionnelles) :
+        Les méthodes vector_* sont non abstraites et retournent None par défaut.
+        Implémenter uniquement si la base supporte les vecteurs.
+        Le bench_runner vérifie has_vector_support avant de les appeler.
     """
 
     name: str = "base"
+
+    # Passer à True dans les connecteurs qui implémentent les méthodes vector_*
+    has_vector_support: bool = False
+
+    # Dimension des vecteurs générés pour le benchmark
+    VECTOR_DIM: int = 128
 
     def __init__(self, dsn: str):
         self.dsn = dsn
@@ -63,7 +75,7 @@ class DBConnector(ABC):
         """
 
     # ------------------------------------------------------------------
-    # Opérations benchmarkées
+    # Opérations benchmarkées — scalaires
     # ------------------------------------------------------------------
 
     @abstractmethod
@@ -89,6 +101,55 @@ class DBConnector(ABC):
     @abstractmethod
     def read_filtered_indexed(self, n_rows: int) -> float:
         """Lecture filtrée après création d'index. Retourne la durée en secondes."""
+
+    # ------------------------------------------------------------------
+    # Opérations vectorielles (optionnelles)
+    # ------------------------------------------------------------------
+
+    def vector_setup(self) -> None:
+        """
+        Crée la table/collection vectorielle et les extensions nécessaires.
+        Appelé avant les opérations vector_*.
+        """
+
+    def vector_teardown(self) -> None:
+        """Supprime la table/collection vectorielle."""
+
+    def vector_insert(self, n_rows: int) -> float:
+        """
+        Insère n_rows vecteurs aléatoires de dimension VECTOR_DIM.
+        Retourne la durée en secondes.
+        """
+        return NotImplemented
+
+    def vector_search_exact(self, n_rows: int, k: int = 10) -> float:
+        """
+        Recherche exacte des k plus proches voisins (brute force).
+        Retourne la durée en secondes.
+        """
+        return NotImplemented
+
+    def vector_search_approx(self, n_rows: int, k: int = 10) -> float:
+        """
+        Recherche approximative (ANN) via index HNSW ou IVFFlat.
+        Retourne la durée en secondes.
+        """
+        return NotImplemented
+
+    # ------------------------------------------------------------------
+    # Utilitaire de génération de vecteurs
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def generate_vectors(cls, n: int) -> np.ndarray:
+        """
+        Génère n vecteurs aléatoires normalisés de dimension VECTOR_DIM.
+        Les vecteurs sont normalisés (norme L2 = 1) pour la similarité cosinus.
+        """
+        rng = np.random.default_rng(seed=42)
+        vecs = rng.standard_normal((n, cls.VECTOR_DIM)).astype(np.float32)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        return vecs / norms
 
     # ------------------------------------------------------------------
     # Utilitaires

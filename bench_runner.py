@@ -5,6 +5,7 @@ bench_runner.py — Orchestrateur du benchmark DB Cutoff
 Usage
 -----
     python bench_runner.py [--db postgresql] [--volumes 100,1000,10000] [--reps 3]
+                           [--ops read_full,read_filtered] [--no-vector]
 
 Variables d'environnement
 -------------------------
@@ -14,6 +15,7 @@ Variables d'environnement
 
 import sys
 import uuid
+import numpy as np
 import importlib
 import argparse
 import logging
@@ -106,11 +108,24 @@ def _build_operations(connector: DBConnector, df_full) -> list[dict]:
 # Runner principal
 # ---------------------------------------------------------------------------
 
+# Toutes les opérations scalaires disponibles — utilisé pour la validation de --ops
+ALL_OPS = [
+    "write_bulk",
+    "write_row_by_row",
+    "read_full",
+    "read_filtered",
+    "read_full_indexed",
+    "read_filtered_indexed",
+]
+
+
 def run_benchmark(
     db_cfg: dict,
     volumes: list[int],
     repetitions: int,
     run_id: str,
+    ops_filter: list[str] | None = None,
+    run_vector: bool = True,
 ) -> None:
     db_name = db_cfg["name"]
     log.info("=== Démarrage benchmark : %s ===", db_name)
@@ -124,11 +139,13 @@ def run_benchmark(
     connector: DBConnector = connector_class(dsn=db_cfg["dsn"])
 
     config_snapshot = {
-        "db_name": db_name,
-        "dsn": db_cfg["dsn"],
-        "volumes": volumes,
+        "db_name":    db_name,
+        "dsn":        db_cfg["dsn"],
+        "volumes":    volumes,
         "repetitions": repetitions,
         "insee_file": INSEE_FILE,
+        "ops_filter": ops_filter or "all",
+        "run_vector": run_vector,
     }
     save_run(run_id, db_name, config_snapshot)
 
@@ -147,6 +164,14 @@ def run_benchmark(
         connector.write_bulk(df_max)
 
         ops = _build_operations(connector, df_max)
+
+        # Filtrage par --ops si spécifié
+        if ops_filter:
+            ops = [op for op in ops if op["name"] in ops_filter]
+            if not ops:
+                log.warning("Aucune opération ne correspond au filtre %s — abandon.", ops_filter)
+                close_run(run_id, "done")
+                return
 
         for op in ops:
             op_name = op["name"]
@@ -200,6 +225,49 @@ def run_benchmark(
                             indexed=op["indexed"],
                         )
 
+        # --- Benchmark vectoriel (si supporté et non désactivé par --no-vector) ---
+        if run_vector and connector.has_vector_support:
+            log.info("--- Benchmark vectoriel : %s ---", db_name)
+            try:
+                connector.vector_setup()
+                for vol in volumes:
+                    for rep in range(1, repetitions + 1):
+                        # Insertion vectorielle
+                        log.info("  %-30s | vol=%7d | rep=%d", "vector_insert", vol, rep)
+                        try:
+                            dur = connector.vector_insert(vol)
+                            save_result(run_id, db_name, "vector_insert", vol, dur, rep)
+                            log.info("    → %.3f s", dur)
+                        except Exception as e:
+                            log.error("    ✗ ERREUR vector_insert : %s", e)
+                            save_result(run_id, db_name, "vector_insert", vol, -1.0, rep)
+
+                        # Recherche exacte
+                        log.info("  %-30s | vol=%7d | rep=%d", "vector_search_exact", vol, rep)
+                        try:
+                            dur = connector.vector_search_exact(vol)
+                            save_result(run_id, db_name, "vector_search_exact", vol, dur, rep)
+                            log.info("    → %.3f s", dur)
+                        except Exception as e:
+                            log.error("    ✗ ERREUR vector_search_exact : %s", e)
+                            save_result(run_id, db_name, "vector_search_exact", vol, -1.0, rep)
+
+                        # Recherche approximative
+                        log.info("  %-30s | vol=%7d | rep=%d", "vector_search_approx", vol, rep)
+                        try:
+                            dur = connector.vector_search_approx(vol)
+                            save_result(run_id, db_name, "vector_search_approx", vol, dur, rep)
+                            log.info("    → %.3f s", dur)
+                        except Exception as e:
+                            log.error("    ✗ ERREUR vector_search_approx : %s", e)
+                            save_result(run_id, db_name, "vector_search_approx", vol, -1.0, rep)
+
+                connector.vector_teardown()
+            except Exception:
+                log.error("Erreur benchmark vectoriel :\n%s", traceback.format_exc())
+        else:
+            log.info("Benchmark vectoriel non supporté par %s — ignoré.", db_name)
+
         close_run(run_id, "done")
         log.info("=== Benchmark terminé : %s ===", db_name)
 
@@ -240,6 +308,21 @@ def parse_args():
         default=REPETITIONS,
         help=f"Nombre de répétitions par mesure (défaut: {REPETITIONS}).",
     )
+    parser.add_argument(
+        "--ops",
+        default=None,
+        help=(
+            "Opérations à exécuter, séparées par virgules. "
+            f"Valeurs possibles : {', '.join(ALL_OPS)}. "
+            "Défaut : toutes. Exemple : --ops read_full,read_filtered"
+        ),
+    )
+    parser.add_argument(
+        "--no-vector",
+        action="store_true",
+        default=False,
+        help="Désactive le benchmark vectoriel même si la base le supporte.",
+    )
     return parser.parse_args()
 
 
@@ -259,12 +342,30 @@ def main():
             log.error("Base '%s' introuvable ou désactivée dans config.py", args.db)
             sys.exit(1)
 
+    # Validation et parsing de --ops
+    ops_filter = None
+    if args.ops:
+        ops_filter = [op.strip() for op in args.ops.split(",")]
+        invalides = [op for op in ops_filter if op not in ALL_OPS]
+        if invalides:
+            log.error(
+                "Opération(s) inconnue(s) : %s\nValeurs acceptées : %s",
+                ", ".join(invalides),
+                ", ".join(ALL_OPS),
+            )
+            sys.exit(1)
+        log.info("Opérations sélectionnées : %s", ", ".join(ops_filter))
+
     init_storage()
     run_id = str(uuid.uuid4())
     log.info("Run ID : %s", run_id)
 
     for db_cfg in dbs:
-        run_benchmark(db_cfg, volumes, args.reps, run_id)
+        run_benchmark(
+            db_cfg, volumes, args.reps, run_id,
+            ops_filter=ops_filter,
+            run_vector=not args.no_vector,
+        )
 
 
 if __name__ == "__main__":

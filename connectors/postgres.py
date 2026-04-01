@@ -115,6 +115,7 @@ class PostgresConnector(DBConnector):
             caractere_employeur VARCHAR(1)
         )
         """
+        self._conn.commit()
         self._conn.autocommit = True
         try:
             with self._conn.cursor() as cur:
@@ -124,6 +125,7 @@ class PostgresConnector(DBConnector):
             self._conn.autocommit = False
 
     def teardown(self) -> None:
+        self._conn.commit()
         self._conn.autocommit = True
         try:
             with self._conn.cursor() as cur:
@@ -286,3 +288,112 @@ class PostgresConnector(DBConnector):
                 log.info("Base '%s' supprimée.", db_name)
             else:
                 log.warning("Base '%s' introuvable — rien à supprimer.", db_name)
+
+
+    # ------------------------------------------------------------------
+    # Opérations vectorielles — pgvector
+    # ------------------------------------------------------------------
+    # Prérequis : CREATE EXTENSION vector;
+    # Installation : https://github.com/pgvector/pgvector
+    #   brew install pgvector          (macOS)
+    #   apt install postgresql-pgvector (Linux)
+    # ------------------------------------------------------------------
+
+    has_vector_support = True
+    VECTOR_TABLE = "insee_vecteurs"
+
+    def vector_setup(self) -> None:
+        """
+        Active l'extension pgvector et crée la table vectorielle.
+        La table contient : siret (clé), embedding (vecteur VECTOR_DIM).
+        """
+        self._conn.commit()
+        self._conn.autocommit = True
+        try:
+            with self._conn.cursor() as cur:
+                # Extension pgvector — silencieux si déjà installée
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                cur.execute(f"DROP TABLE IF EXISTS {self.VECTOR_TABLE}")
+                cur.execute(f"""
+                    CREATE TABLE {self.VECTOR_TABLE} (
+                        id      SERIAL PRIMARY KEY,
+                        siret   VARCHAR(14),
+                        embedding vector({self.VECTOR_DIM})
+                    )
+                """)
+        finally:
+            self._conn.autocommit = False
+        log.info("pgvector : table '%s' créée (dim=%d).", self.VECTOR_TABLE, self.VECTOR_DIM)
+
+    def vector_teardown(self) -> None:
+        self._conn.commit()
+        self._conn.autocommit = True
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {self.VECTOR_TABLE}")
+        finally:
+            self._conn.autocommit = False
+
+    def vector_insert(self, n_rows: int) -> float:
+        """Insère n_rows vecteurs via COPY (le plus rapide avec pgvector)."""
+        vecs = self.generate_vectors(n_rows)
+        copy_sql = f"COPY {self.VECTOR_TABLE} (siret, embedding) FROM STDIN"
+        t0 = time.perf_counter()
+        with self._conn.cursor() as cur:
+            with cur.copy(copy_sql) as copy:
+                for i, vec in enumerate(vecs):
+                    siret = f"{i:014d}"
+                    # pgvector attend le format '[0.1,0.2,...]'
+                    vec_str = "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
+                    copy.write_row((siret, vec_str))
+        self._conn.commit()
+        return time.perf_counter() - t0
+
+    def vector_search_exact(self, n_rows: int, k: int = 10) -> float:
+        """
+        Recherche exacte (brute force) des k plus proches voisins
+        par distance L2 (<->) sans index — mesure le coût séquentiel.
+        """
+        query_vec = self.generate_vectors(1)[0]
+        vec_str = "[" + ",".join(f"{v:.6f}" for v in query_vec) + "]"
+        t0 = time.perf_counter()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT siret, embedding <-> %s::vector AS dist "
+                f"FROM {self.VECTOR_TABLE} ORDER BY dist LIMIT %s",
+                (vec_str, k),
+            )
+            cur.fetchall()
+        return time.perf_counter() - t0
+
+    def vector_search_approx(self, n_rows: int, k: int = 10) -> float:
+        """
+        Recherche approximative (ANN) via index HNSW.
+        HNSW (Hierarchical Navigable Small World) offre le meilleur
+        compromis rappel/vitesse pour pgvector.
+        L'index est créé avant la mesure (non inclus dans le temps).
+        """
+        # Création de l'index HNSW si absent
+        self._conn.commit()   # clôture la transaction avant autocommit
+        self._conn.autocommit = True
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{self.VECTOR_TABLE}_hnsw "
+                    f"ON {self.VECTOR_TABLE} "
+                    f"USING hnsw (embedding vector_l2_ops)"
+                )
+        finally:
+            self._conn.autocommit = False
+
+        query_vec = self.generate_vectors(1)[0]
+        vec_str = "[" + ",".join(f"{v:.6f}" for v in query_vec) + "]"
+        t0 = time.perf_counter()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT siret, embedding <-> %s::vector AS dist "
+                f"FROM {self.VECTOR_TABLE} ORDER BY dist LIMIT %s",
+                (vec_str, k),
+            )
+            cur.fetchall()
+        return time.perf_counter() - t0

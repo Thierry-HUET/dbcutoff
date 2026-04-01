@@ -217,3 +217,82 @@ class DuckDBConnector(DBConnector):
             [FILTER_VAL, n_rows],
         ).fetchall()
         return time.perf_counter() - t0
+
+
+    # ------------------------------------------------------------------
+    # Opérations vectorielles — DuckDB natif
+    # ------------------------------------------------------------------
+    # DuckDB supporte les vecteurs nativement via le type FLOAT[n]
+    # et les fonctions array_cosine_similarity(), array_distance().
+    # Pas d'extension requise.
+    # ------------------------------------------------------------------
+
+    has_vector_support = True
+    VECTOR_TABLE = "insee_vecteurs"
+
+    def vector_setup(self) -> None:
+        """Crée la table vectorielle DuckDB."""
+        self._conn.execute(f"DROP TABLE IF EXISTS {self.VECTOR_TABLE}")
+        self._conn.execute(f"""
+            CREATE TABLE {self.VECTOR_TABLE} (
+                id        INTEGER,
+                siret     VARCHAR,
+                embedding FLOAT[{self.VECTOR_DIM}]
+            )
+        """)
+        log.info("DuckDB vecteurs : table '%s' créée (dim=%d).", self.VECTOR_TABLE, self.VECTOR_DIM)
+
+    def vector_teardown(self) -> None:
+        self._conn.execute(f"DROP TABLE IF EXISTS {self.VECTOR_TABLE}")
+
+    def vector_insert(self, n_rows: int) -> float:
+        """
+        Insère n_rows vecteurs via INSERT ... SELECT FROM df.
+        DuckDB scanne le DataFrame directement — méthode la plus rapide.
+        """
+        import pandas as pd
+        vecs = self.generate_vectors(n_rows)
+        df_vec = pd.DataFrame({
+            "id":        range(n_rows),
+            "siret":     [f"{i:014d}" for i in range(n_rows)],
+            "embedding": [vec.tolist() for vec in vecs],
+        })
+        t0 = time.perf_counter()
+        self._conn.execute(
+            f"INSERT INTO {self.VECTOR_TABLE} SELECT * FROM df_vec"
+        )
+        return time.perf_counter() - t0
+
+    def vector_search_exact(self, n_rows: int, k: int = 10) -> float:
+        """
+        Recherche exacte par similarité cosinus (brute force).
+        DuckDB utilise array_cosine_similarity() — scan séquentiel.
+        """
+        query_vec = self.generate_vectors(1)[0].tolist()
+        t0 = time.perf_counter()
+        self._conn.execute(
+            f"SELECT siret, array_cosine_similarity(embedding, ?::FLOAT[{self.VECTOR_DIM}]) AS sim "
+            f"FROM {self.VECTOR_TABLE} ORDER BY sim DESC LIMIT ?",
+            [query_vec, k],
+        ).fetchall()
+        return time.perf_counter() - t0
+
+    def vector_search_approx(self, n_rows: int, k: int = 10) -> float:
+        """
+        DuckDB ne dispose pas d'index ANN natif (HNSW) en v0.10.
+        La recherche approximative est émulée par un scan avec filtre
+        sur une partition aléatoire (10% des données) — cela mesure
+        l'impact du volume réduit vs le scan complet.
+        Note : DuckDB vss extension (expérimentale) apporte HNSW
+        mais n'est pas encore stable en production.
+        """
+        query_vec = self.generate_vectors(1)[0].tolist()
+        sample_pct = 10
+        t0 = time.perf_counter()
+        self._conn.execute(
+            f"SELECT siret, array_cosine_similarity(embedding, ?::FLOAT[{self.VECTOR_DIM}]) AS sim "
+            f"FROM {self.VECTOR_TABLE} USING SAMPLE {sample_pct}% "
+            f"ORDER BY sim DESC LIMIT ?",
+            [query_vec, k],
+        ).fetchall()
+        return time.perf_counter() - t0

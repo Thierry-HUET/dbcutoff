@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 bench_viz.py — Dashboard Streamlit : visualisation des résultats DB Cutoff
 
@@ -105,7 +104,7 @@ df_agg = (
 # Header
 # ---------------------------------------------------------------------------
 st.title("📊 DB Cutoff Analyzer")
-st.markdown("""> <small>Identification visuelle du point de rupture des bases de données  \n©️ APERTO-NOTA - 04/2026 - [Thierry HUET](mailto:thierry.huet@aperto-nota.fr)</small>""", unsafe_allow_html=True)
+st.caption("Identification visuelle du point de rupture des bases de données — source INSEE")
 
 col1, col2, col3 = st.columns(3)
 col1.metric("Mesures totales", len(df))
@@ -255,6 +254,56 @@ if not df_write.empty:
     st.plotly_chart(fig3, use_container_width=True)
 else:
     st.info("Aucune opération d'écriture disponible dans les filtres actuels.")
+
+# ---------------------------------------------------------------------------
+# Graphique vectoriel
+# ---------------------------------------------------------------------------
+st.subheader("Recherche vectorielle : exacte vs approximative")
+
+df_vec = df_agg[df_agg["operation"].str.startswith("vector_")].copy()
+
+if not df_vec.empty:
+    fig_vec = go.Figure()
+    c_idx_v = 0
+
+    for (db, op), grp in df_vec.groupby(["db_name", "operation"]):
+        couleur = COLORS[c_idx_v % len(COLORS)]
+        c_idx_v += 1
+        tiret = "dot" if "approx" in op else "solid"
+        libelle = f"{db} · {label_op(op)}"
+        grp_trie = grp.sort_values("volume")
+        fig_vec.add_trace(go.Scatter(
+            x=grp_trie["volume"],
+            y=grp_trie["duration_med"],
+            mode="lines+markers",
+            name=libelle,
+            line=dict(color=couleur, dash=tiret, width=2),
+            marker=dict(size=6),
+            hovertemplate=(
+                f"<b>{libelle}</b><br>"
+                "Volume : %{x:,} vecteurs<br>"
+                "Durée (médiane) : %{y:.3f} s<extra></extra>"
+            ),
+        ))
+
+    fig_vec.update_layout(
+        xaxis=dict(title="Volume (vecteurs)", type="log", gridcolor="#e0e0e0"),
+        yaxis=dict(title="Durée médiane (s)", type="log", gridcolor="#e0e0e0"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=420,
+        font=dict(family="Avenir, Helvetica Neue, sans-serif", color="#222"),
+    )
+    st.plotly_chart(fig_vec, use_container_width=True)
+    st.caption(
+        "Ligne pleine = recherche exacte (brute force) · "
+        "Ligne pointillée = recherche approximative (ANN / HNSW) · "
+        "Dimension des vecteurs : 128"
+    )
+else:
+    st.info("Aucune mesure vectorielle disponible. "
+            "Relancer le benchmark sur une base compatible (PostgreSQL avec pgvector, DuckDB).")
 
 # ---------------------------------------------------------------------------
 # Tableau récapitulatif

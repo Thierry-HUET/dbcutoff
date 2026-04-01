@@ -241,6 +241,18 @@ files = [
 ]
 
 [[package]]
+name = "couchdb"
+version = "1.2"
+description = "Python library for working with CouchDB"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "CouchDB-1.2-py2.py3-none-any.whl", hash = "sha256:13a28a1159c49f8346732e8724b9a4d65cba54bec017c4a7eeb1499fe88151d1"},
+    {file = "CouchDB-1.2.tar.gz", hash = "sha256:1386a1a43f25bed3667e3b805222054940d674fa1967fa48e9d2012a18630ab7"},
+]
+
+[[package]]
 name = "dnspython"
 version = "2.8.0"
 description = "DNS toolkit"
@@ -1502,4 +1514,4 @@ watchmedo = ["PyYAML (>=3.10)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.14,<4.0"
-content-hash = "068c0f04513d2fd5685360b1af51a6dedf4182a84852fe55bfc8cad1ee685cdb"
+content-hash = "e49573fd15d5b0715c7cef2ef98d5193a90e35105b0f726c160687899f35dfa3"
