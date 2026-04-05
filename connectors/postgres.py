@@ -279,6 +279,17 @@ class PostgresConnector(DBConnector):
             cur.fetchall()
         return time.perf_counter() - t0
 
+    def get_version(self) -> str:
+        """Retourne la version PostgreSQL (ex: 'PostgreSQL 16.2')."""
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT version()")
+                row = cur.fetchone()
+            # version() retourne ex: 'PostgreSQL 16.2 on x86_64...'
+            return row[0].split("on")[0].strip() if row else ""
+        except Exception:
+            return ""
+
     def drop_database(self) -> None:
         """
         Supprime la base cible après le benchmark.

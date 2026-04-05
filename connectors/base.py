@@ -155,5 +155,12 @@ class DBConnector(ABC):
     # Utilitaires
     # ------------------------------------------------------------------
 
+    def get_version(self) -> str:
+        """
+        Retourne la version du moteur de base de données sous forme de chaîne.
+        Appelé après connect(). Retourne "" si non implémenté.
+        """
+        return ""
+
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} dsn={self.dsn!r}>"

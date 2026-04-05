@@ -84,11 +84,43 @@ st.divider()
 st.subheader("🏆 Meilleures performances par opération")
 
 if not df_agg.empty:
-    pivot = (
-        df_agg.groupby(["db_name", "operation"])["duration_med"]
-        .min()
-        .reset_index()
-    )
+    # ---------------------------------------------------------------------------
+    # Comparaison au volume maximum COMMUN à toutes les bases
+    # → évite qu'une base paraisse bonne parce qu'elle est mesurée
+    #   uniquement à petit volume (ex: MongoDB à 100 lignes vs PostgreSQL à 10M)
+    # ---------------------------------------------------------------------------
+
+    # Volume max commun : le plus grand volume présent chez TOUTES les bases
+    # pour chaque opération
+    def pivot_at_common_max(df: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for op, grp in df.groupby("operation"):
+            # Volumes disponibles par base pour cette opération
+            vol_by_db = grp.groupby("db_name")["volume"].max()
+            if vol_by_db.empty:
+                continue
+            # Volume commun = le plus petit des max (présent chez toutes les bases)
+            common_vol = vol_by_db.min()
+            subset = grp[grp["volume"] == common_vol]
+            for _, row in subset.iterrows():
+                rows.append({
+                    "db_name":      row["db_name"],
+                    "operation":    op,
+                    "duration_med": row["duration_med"],
+                    "volume_ref":   common_vol,
+                })
+        return pd.DataFrame(rows)
+
+    pivot = pivot_at_common_max(df_agg)
+
+    if pivot.empty:
+        pivot = (
+            df_agg.groupby(["db_name", "operation"])["duration_med"]
+            .min().reset_index()
+        )
+        volume_note = "volume minimum"
+    else:
+        volume_note = f"volume commun le plus élevé par opération"
 
     # Pour chaque opération, trouver la base la plus rapide
     best = (
@@ -117,23 +149,32 @@ if not df_agg.empty:
     }
     GROUP_ORDER = ["✍️ Écriture", "📖 Lecture", "🔢 Vectoriel"]
 
-    pivot_wide = pivot.copy()
-    pivot_wide["groupe"]    = pivot_wide["operation"].map(OP_GROUPS).fillna("Autre")
-    pivot_wide["operation"] = pivot_wide["operation"].map(label_op)
-    pivot_wide = pivot_wide.pivot(
+    # --- Tableau en valeurs brutes (secondes) ---
+    pivot_wide_raw = pivot.copy()
+    pivot_wide_raw["groupe"]    = pivot_wide_raw["operation"].map(OP_GROUPS).fillna("Autre")
+    pivot_wide_raw["operation"] = pivot_wide_raw["operation"].map(label_op)
+    pivot_wide_raw = pivot_wide_raw.pivot(
         index=["groupe", "operation"], columns="db_name", values="duration_med"
     )
-    pivot_wide.index.names  = ["Groupe", "Opération"]
-    pivot_wide.columns.name = None
-
-    # Trier par groupe dans l'ordre défini
-    pivot_wide = pivot_wide.reindex(
-        [g for g in GROUP_ORDER if g in pivot_wide.index.get_level_values("Groupe")],
+    pivot_wide_raw.index.names  = ["Groupe", "Opération"]
+    pivot_wide_raw.columns.name = None
+    pivot_wide_raw = pivot_wide_raw.reindex(
+        [g for g in GROUP_ORDER if g in pivot_wide_raw.index.get_level_values("Groupe")],
         level="Groupe",
     )
 
-    def highlight_minmax(row):
-        """Vert = meilleur, Rouge = pire sur la ligne (NaN ignorés)."""
+    # --- Tableau en pourcentage (min de la ligne = 100%) ---
+    def to_pct(row):
+        """Convertit une ligne en % par rapport au minimum (meilleur = 100%)."""
+        valid = row.dropna()
+        if valid.empty or valid.min() == 0:
+            return row
+        return (row / valid.min() * 100).round(0)
+
+    pivot_wide_pct = pivot_wide_raw.apply(to_pct, axis=1)
+
+    def highlight_minmax_pct(row):
+        """Vert = 100% (meilleur) · Rouge = valeur max (pire) · NaN ignorés."""
         styles = []
         valid  = row.dropna()
         if valid.empty:
@@ -144,24 +185,40 @@ if not df_agg.empty:
                 styles.append("")
             elif mn == mx:
                 styles.append("")
-            elif v == mn:
+            elif v == mn:   # = 100% → meilleur
                 styles.append("background-color: #d4f0d4; font-weight:bold")
-            elif v == mx:
+            elif v == mx:   # = valeur max → pire
                 styles.append("background-color: #f9d4d4; font-weight:bold")
             else:
                 styles.append("")
         return styles
 
+    # Basculer entre les deux vues
+    vue = st.radio(
+        "Affichage",
+        ["Pourcentage (min = 100%)", "Durée brute (secondes)"],
+        horizontal=True,
+    )
+
+    if vue == "Pourcentage (min = 100%)":
+        df_display = pivot_wide_pct
+        fmt        = "{:.0f} %"
+        note_fmt   = "100% = meilleure performance de la ligne"
+    else:
+        df_display = pivot_wide_raw
+        fmt        = "{:.4f} s"
+        note_fmt   = "valeurs en secondes (médiane)"
+
     st.dataframe(
-        pivot_wide.style
-        .apply(highlight_minmax, axis=1)
-        .format("{:.4f}", na_rep="—"),
+        df_display.style
+        .apply(highlight_minmax_pct, axis=1)
+        .format(fmt, na_rep="—"),
         width="stretch",
     )
     st.caption(
-        "🟢 Cellule verte = meilleure performance · "
-        "🔴 Cellule rouge = moins bonne performance · "
-        "— = non testé"
+        f"🟢 = meilleure performance ({note_fmt}) · "
+        f"🔴 = moins bonne · — = non testé · "
+        f"Référence : {volume_note}"
     )
 
 st.divider()

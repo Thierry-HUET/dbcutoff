@@ -20,11 +20,35 @@ INSEE_FILE = os.environ.get(
     str(BASE_DIR / "data" / "StockEtablissementHistorique_utf8.csv"),
 )
 
-# --- Benchmark ---
-VOLUMES         = [ 1_000, 3_160, 10_000, 31_600, 100_000, 316_000, 1_000_000, 3_160_000,10_000_000,31_160_000,100_000_000]
+# --- Benchmark scalaire ---
+# Progression logarithmique base 10 (×√10 ≈ ×3.16 entre chaque palier)
+# → points régulièrement espacés sur l'axe log du graphique
+# Filtrage automatique selon MAX_ROWS pour éviter de dépasser le fichier INSEE
+MAX_ROWS = int(os.environ.get("MAX_ROWS", "10_000_000".replace("_", "")))
+
+_VOLUMES_ALL = [
+      1_000,   3_160,
+     10_000,  31_600,
+    100_000, 316_000,
+  1_000_000, 3_160_000,
+ 10_000_000, 31_600_000,
+ 100_000_000
+]
+VOLUMES = [v for v in _VOLUMES_ALL if v <= MAX_ROWS]
+
 BATCH_SIZES     = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000]
 REPETITIONS     = 3
-TIMEOUT_SECONDS = 600
+TIMEOUT_SECONDS = 300
+
+# --- Benchmark vectoriel ---
+# Volumes indépendants du benchmark scalaire.
+# Limités à 1M par défaut : les vecteurs dim=128 en float32 consomment
+# ~50 Mo pour 100k vecteurs et ~500 Mo pour 1M — RAM raisonnable.
+# Ajustable via VECTOR_MAX_ROWS dans .env.
+VECTOR_MAX_ROWS = int(os.environ.get("VECTOR_MAX_ROWS", "1_000_000".replace("_", "")))
+VECTOR_VOLUMES  = [v for v in [
+    1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000
+] if v <= VECTOR_MAX_ROWS]
 
 # --- Colonnes retenues du fichier INSEE ---
 INSEE_COLUMNS = [
@@ -36,8 +60,6 @@ INSEE_COLUMNS = [
     "activitePrincipaleEtablissement",    # code NAF/APE
     "caractereEmployeurEtablissement",    # O=employeur, N=non-employeur
 ]
-
-
 
 # --- Bases de données disponibles ---
 DATABASES = [
@@ -75,6 +97,7 @@ DATABASES = [
             "mysql+pymysql://root@localhost:3306/db_cutoff",
         ),
     },
+    # { "name": "neo4j",     "module": "connectors.neo4j",     "enabled": False, "dsn": "bolt://localhost:7687" },
     {
         "name": "couchdb",
         "module": "connectors.couchdb",
@@ -83,7 +106,6 @@ DATABASES = [
             "COUCHDB_DSN",
             "http://admin:admin@localhost:5984/db_cutoff",
         ),
-    }
-    # { "name": "neo4j",     "module": "connectors.neo4j",     "enabled": False, "dsn": "bolt://localhost:7687" },
+    },
     # { "name": "cassandra", "module": "connectors.cassandra", "enabled": False, "dsn": "localhost" },
 ]

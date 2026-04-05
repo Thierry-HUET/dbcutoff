@@ -138,6 +138,14 @@ class MongoDBConnector(DBConnector):
         self._col.drop()
         log.info("MongoDB : collection '%s' supprimée.", COLLECTION)
 
+    def get_version(self) -> str:
+        """Retourne la version MongoDB (ex: 'MongoDB 7.0.4')."""
+        try:
+            info = self._client.server_info()
+            return f"MongoDB {info.get('version', '')}"
+        except Exception:
+            return ""
+
     def drop_database(self) -> None:
         """Supprime la base entière via le client."""
         if self._client is None:

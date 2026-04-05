@@ -18,13 +18,14 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def init_storage() -> None:
-    """Crée les tables si elles n'existent pas."""
+    """Crée les tables et ajoute les colonnes manquantes si nécessaire."""
     with _get_conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS bench_run (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id      TEXT NOT NULL,
                 db_name     TEXT NOT NULL,
+                db_version  TEXT,
                 started_at  TEXT NOT NULL,
                 ended_at    TEXT,
                 status      TEXT DEFAULT 'running',
@@ -47,13 +48,19 @@ def init_storage() -> None:
             CREATE INDEX IF NOT EXISTS idx_result_run ON bench_result(run_id);
             CREATE INDEX IF NOT EXISTS idx_result_db  ON bench_result(db_name);
         """)
+        # Migration : ajouter db_version si la table existait sans cette colonne
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(bench_run)").fetchall()]
+        if "db_version" not in cols:
+            conn.execute("ALTER TABLE bench_run ADD COLUMN db_version TEXT")
 
 
-def save_run(run_id: str, db_name: str, config: dict) -> None:
+def save_run(run_id: str, db_name: str, config: dict, db_version: str = "") -> None:
     with _get_conn() as conn:
         conn.execute(
-            "INSERT INTO bench_run (run_id, db_name, started_at, config_json) VALUES (?,?,?,?)",
-            (run_id, db_name, _now(), json.dumps(config)),
+            """INSERT INTO bench_run
+               (run_id, db_name, db_version, started_at, config_json)
+               VALUES (?,?,?,?,?)""",
+            (run_id, db_name, db_version, _now(), json.dumps(config)),
         )
 
 
@@ -107,6 +114,22 @@ def fetch_runs() -> list[dict]:
             "SELECT * FROM bench_run ORDER BY started_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def fetch_versions() -> dict[str, str]:
+    """
+    Retourne un dict {db_name: db_version} en prenant
+    la version du run le plus récent pour chaque base.
+    """
+    with _get_conn() as conn:
+        rows = conn.execute("""
+            SELECT db_name, db_version
+            FROM bench_run
+            WHERE db_version IS NOT NULL AND db_version != ''
+            GROUP BY db_name
+            HAVING started_at = MAX(started_at)
+        """).fetchall()
+    return {r["db_name"]: r["db_version"] for r in rows}
 
 
 def _now() -> str:

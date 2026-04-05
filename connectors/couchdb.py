@@ -135,6 +135,17 @@ class CouchDBConnector(DBConnector):
         if not resp.ok and resp.status_code != 404:
             log.warning("CouchDB teardown : %s", resp.text)
 
+    def get_version(self) -> str:
+        """Retourne la version CouchDB (ex: 'CouchDB 3.3.2')."""
+        try:
+            resp = self._session.get(self._server_url("/"))
+            if resp.ok:
+                v = resp.json().get("version", "")
+                return f"CouchDB {v}" if v else ""
+        except Exception:
+            pass
+        return ""
+
     def drop_database(self) -> None:
         """Supprime la base après le benchmark."""
         # Ouvrir une session temporaire si déconnecté

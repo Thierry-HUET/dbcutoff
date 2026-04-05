@@ -111,6 +111,14 @@ class DuckDBConnector(DBConnector):
     def teardown(self) -> None:
         self._conn.execute(f"DROP TABLE IF EXISTS {TABLE}")
 
+    def get_version(self) -> str:
+        """Retourne la version DuckDB (ex: 'DuckDB 0.10.1')."""
+        try:
+            row = self._conn.execute("SELECT version()").fetchone()
+            return f"DuckDB {row[0]}" if row else ""
+        except Exception:
+            return ""
+
     def drop_database(self) -> None:
         """
         Supprime le fichier DuckDB sur disque.

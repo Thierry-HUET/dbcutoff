@@ -22,7 +22,7 @@ import logging
 import traceback
 from typing import Callable
 
-from config import DATABASES, VOLUMES, REPETITIONS, INSEE_FILE, BATCH_SIZES
+from config import DATABASES, VOLUMES, REPETITIONS, INSEE_FILE, BATCH_SIZES, VECTOR_VOLUMES
 from loaders.insee_loader import load_sample
 from storage.db_store import init_storage, save_run, close_run, save_result
 from connectors.base import DBConnector
@@ -109,7 +109,8 @@ def _build_operations(connector: DBConnector, df_full) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 # Toutes les opérations scalaires disponibles — utilisé pour la validation de --ops
-ALL_OPS = [
+# Opérations scalaires
+ALL_OPS_SCALAR = [
     "write_bulk",
     "write_row_by_row",
     "read_full",
@@ -117,6 +118,16 @@ ALL_OPS = [
     "read_full_indexed",
     "read_filtered_indexed",
 ]
+
+# Opérations vectorielles — sélectionnables via --ops
+# Note : write_row_by_row est plafonné à 10 000 lignes (max_volume)
+ALL_OPS_VECTOR = [
+    "vector_insert",
+    "vector_search_exact",
+    "vector_search_approx",
+]
+
+ALL_OPS = ALL_OPS_SCALAR + ALL_OPS_VECTOR
 
 
 def run_benchmark(
@@ -152,26 +163,38 @@ def run_benchmark(
     try:
         connector.ensure_database()
         connector.connect()
+        db_version = connector.get_version()
+        log.info("Version : %s", db_version or "(inconnue)")
+        # Mettre à jour la version dans bench_run
+        from storage.db_store import _get_conn as _gsq
+        with _gsq() as _c:
+            _c.execute(
+                "UPDATE bench_run SET db_version=? WHERE run_id=? AND db_name=?",
+                (db_version, run_id, db_name),
+            )
         connector.setup()
 
-        # Pré-chargement du volume max (pour les lectures)
+        # Chargement du DataFrame au volume max — utilisé pour les sous-échantillons
+        # Pas d'insertion initiale : chaque opération de lecture recharge
+        # exactement le volume nécessaire via write_bulk(df_sample).
         max_vol = max(volumes)
         log.info("Chargement du jeu de données INSEE (%d lignes)…", max_vol)
         df_max = load_sample(INSEE_FILE, max_vol)
-
-        # Insertion initiale pour les opérations de lecture
-        log.info("Insertion initiale (%d lignes) pour lectures…", max_vol)
-        connector.write_bulk(df_max)
 
         ops = _build_operations(connector, df_max)
 
         # Filtrage par --ops si spécifié
         if ops_filter:
+            # Filtrer les ops scalaires (les ops vectorielles sont gérées séparément)
             ops = [op for op in ops if op["name"] in ops_filter]
-            if not ops:
+            scalar_active = [op for op in ops_filter if op in ALL_OPS_SCALAR]
+            vector_active = [op for op in ops_filter if op in ALL_OPS_VECTOR]
+            if not scalar_active and not vector_active:
                 log.warning("Aucune opération ne correspond au filtre %s — abandon.", ops_filter)
                 close_run(run_id, "done")
                 return
+            if not scalar_active:
+                log.info("Aucune opération scalaire dans le filtre — passage direct au vectoriel.")
 
         for op in ops:
             op_name = op["name"]
@@ -227,42 +250,38 @@ def run_benchmark(
 
         # --- Benchmark vectoriel (si supporté et non désactivé par --no-vector) ---
         if run_vector and connector.has_vector_support:
-            log.info("--- Benchmark vectoriel : %s ---", db_name)
+            log.info("--- Benchmark vectoriel : %s (volumes : %s) ---",
+                     db_name, VECTOR_VOLUMES)
             try:
-                connector.vector_setup()
-                for vol in volumes:
-                    for rep in range(1, repetitions + 1):
-                        # Insertion vectorielle
-                        log.info("  %-30s | vol=%7d | rep=%d", "vector_insert", vol, rep)
-                        try:
-                            dur = connector.vector_insert(vol)
-                            save_result(run_id, db_name, "vector_insert", vol, dur, rep)
-                            log.info("    → %.3f s", dur)
-                        except Exception as e:
-                            log.error("    ✗ ERREUR vector_insert : %s", e)
-                            save_result(run_id, db_name, "vector_insert", vol, -1.0, rep)
+                # Déterminer quelles opérations vectorielles exécuter
+                vec_ops_active = [
+                    op for op in ALL_OPS_VECTOR
+                    if ops_filter is None or op in ops_filter
+                ]
 
-                        # Recherche exacte
-                        log.info("  %-30s | vol=%7d | rep=%d", "vector_search_exact", vol, rep)
-                        try:
-                            dur = connector.vector_search_exact(vol)
-                            save_result(run_id, db_name, "vector_search_exact", vol, dur, rep)
-                            log.info("    → %.3f s", dur)
-                        except Exception as e:
-                            log.error("    ✗ ERREUR vector_search_exact : %s", e)
-                            save_result(run_id, db_name, "vector_search_exact", vol, -1.0, rep)
+                if not vec_ops_active:
+                    log.info("Aucune opération vectorielle dans le filtre — ignoré.")
+                else:
+                    connector.vector_setup()
+                    for vol in VECTOR_VOLUMES:
+                        for rep in range(1, repetitions + 1):
+                            for op_name, fn in [
+                                ("vector_insert",       connector.vector_insert),
+                                ("vector_search_exact", connector.vector_search_exact),
+                                ("vector_search_approx",connector.vector_search_approx),
+                            ]:
+                                if op_name not in vec_ops_active:
+                                    continue
+                                log.info("  %-30s | vol=%7d | rep=%d", op_name, vol, rep)
+                                try:
+                                    dur = fn(vol)
+                                    save_result(run_id, db_name, op_name, vol, dur, rep)
+                                    log.info("    → %.3f s", dur)
+                                except Exception as e:
+                                    log.error("    ✗ ERREUR %s : %s", op_name, e)
+                                    save_result(run_id, db_name, op_name, vol, -1.0, rep)
 
-                        # Recherche approximative
-                        log.info("  %-30s | vol=%7d | rep=%d", "vector_search_approx", vol, rep)
-                        try:
-                            dur = connector.vector_search_approx(vol)
-                            save_result(run_id, db_name, "vector_search_approx", vol, dur, rep)
-                            log.info("    → %.3f s", dur)
-                        except Exception as e:
-                            log.error("    ✗ ERREUR vector_search_approx : %s", e)
-                            save_result(run_id, db_name, "vector_search_approx", vol, -1.0, rep)
-
-                connector.vector_teardown()
+                    connector.vector_teardown()
             except Exception:
                 log.error("Erreur benchmark vectoriel :\n%s", traceback.format_exc())
         else:

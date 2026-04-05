@@ -1,31 +1,48 @@
 """
-connectors/postgres.py — Connecteur PostgreSQL via psycopg v3
+connectors/mysql.py — Connecteur MySQL / MariaDB via pymysql
 
-Dépendance : psycopg[binary]>=3.1  (PAS psycopg2)
+docker run -d \
+  --name mysql-myvector \
+  -p 3306:3306 \
+  -e MYSQL_ALLOW_EMPTY_PASSWORD=true \
+  ghcr.io/askdba/myvector:mysql-8.4 \
+  --loose-myvector_binlog_socket=/var/run/mysqld/mysqld.sock
 
-Logique de création de base :
-    ensure_database() se connecte à la base système 'postgres',
-    vérifie si la base cible existe dans pg_database et la crée
-    en AUTOCOMMIT si nécessaire (CREATE DATABASE interdit en transaction).
+Dépendance : pymysql>=1.1
+
+Spécificités MySQL vs PostgreSQL :
+    - Pas de protocole COPY — write_bulk() utilise executemany() avec
+      INSERT INTO ... VALUES en lot, optimisé par pymysql
+    - DDL (CREATE/DROP TABLE, CREATE/DROP INDEX) implicitement en autocommit
+      MySQL valide automatiquement les DDL — pas besoin de gestion explicite
+      comme avec psycopg v3
+    - TRUNCATE TABLE réutilisable sans risque de deadlock (pas de conflit
+      avec les index sous MySQL/InnoDB dans ce contexte)
+    - Paramètres de requête : notation '%s' (identique à psycopg)
+    - ensure_database() : connexion sans base cible via DSN sans path,
+      puis CREATE DATABASE IF NOT EXISTS
+    - drop_database()   : DROP DATABASE via connexion système
+    - Moteur InnoDB par défaut (transactions, FK, index B-tree)
+
+DSN format : mysql+pymysql://utilisateur:motdepasse@hôte:3306/ma_base
 """
 
 import time
 import logging
 from urllib.parse import urlparse, urlunparse
 
-import psycopg
+import pymysql
+import pymysql.cursors
 import pandas as pd
 
 from connectors.base import DBConnector
 
 log = logging.getLogger(__name__)
 
-TABLE      = "insee_etablissements"
+TABLE            = "insee_etablissements"
 INDEX_COL        = "siret"               # index pour lookup par identifiant
 INDEX_FILTER_COL = "etat_administratif"  # index pour accélérer les lectures filtrées
-FILTER_VAL       = "F"                   # etat_administratif = 'F' (fermé)
-# 'F' est la valeur MINORITAIRE — PostgreSQL utilisera l'index (haute sélectivité)
-# 'A' (actif, majoritaire) déclencherait un sequential scan même avec index
+FILTER_VAL       = "F"                   # etat_administratif = 'F' (fermé, minoritaire)
 
 COLS = (
     "siret",
@@ -42,32 +59,44 @@ INSERT_SQL = (
     f"VALUES ({', '.join(['%s'] * len(COLS))})"
 )
 
-COPY_SQL = f"COPY {TABLE} ({', '.join(COLS)}) FROM STDIN"
 
-
-def _system_dsn(dsn: str) -> str:
+def _parse_dsn(dsn: str) -> dict:
     """
-    Remplace la base cible par 'postgres' dans le DSN pour permettre
-    la connexion au serveur avant que la base cible n'existe.
+    Parse le DSN mysql+pymysql://user:pwd@host:port/dbname
+    et retourne un dict de kwargs pour pymysql.connect().
     """
-    p = urlparse(dsn)
-    # path = '/db_cutoff' → '/postgres'
-    system = p._replace(path="/postgres")
-    return urlunparse(system)
+    # Supprimer le préfixe 'mysql+pymysql://' si présent
+    raw = dsn.replace("mysql+pymysql://", "mysql://")
+    p = urlparse(raw)
+    kwargs = {
+        "host":   p.hostname or "localhost",
+        "port":   p.port or 3306,
+        "user":   p.username or "root",
+        "passwd": p.password or "",
+        "charset": "utf8mb4",
+        "cursorclass": pymysql.cursors.Cursor,
+    }
+    db = p.path.lstrip("/")
+    if db:
+        kwargs["db"] = db
+    return kwargs
 
 
 def _db_name(dsn: str) -> str:
     """Extrait le nom de la base depuis le DSN."""
-    return urlparse(dsn).path.lstrip("/")
+    raw = dsn.replace("mysql+pymysql://", "mysql://")
+    return urlparse(raw).path.lstrip("/")
 
 
-class PostgresConnector(DBConnector):
+class MySQLConnector(DBConnector):
 
-    name = "postgresql"
+    name = "mysql"
 
     def __init__(self, dsn: str):
         super().__init__(dsn)
-        self._conn: psycopg.Connection | None = None
+        self._conn: pymysql.Connection | None = None
+        self._db_name_val = _db_name(dsn)
+        MySQLConnector._db_name_val = self._db_name_val  # accès depuis vector_search_approx
 
     # ------------------------------------------------------------------
     # Cycle de vie
@@ -76,36 +105,37 @@ class PostgresConnector(DBConnector):
     def ensure_database(self) -> None:
         """
         Crée la base cible si elle n'existe pas.
-        Connexion temporaire à 'postgres' en autocommit
-        (CREATE DATABASE est interdit dans une transaction).
+        Connexion sans base (pas de 'db' dans les kwargs).
         """
-        db_name = _db_name(self.dsn)
-        sys_dsn = _system_dsn(self.dsn)
+        kwargs = _parse_dsn(self.dsn)
+        kwargs.pop("db", None)          # connexion au serveur sans base cible
 
-        with psycopg.connect(sys_dsn, autocommit=True) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM pg_database WHERE datname = %s", (db_name,)
-            ).fetchone()
-
-            if row is None:
-                log.info("Base '%s' absente — création en cours…", db_name)
-                # Les identifiants ne peuvent pas être paramétrés dans DDL
-                conn.execute(f'CREATE DATABASE "{db_name}"')
-                log.info("Base '%s' créée.", db_name)
-            else:
-                log.info("Base '%s' déjà existante.", db_name)
+        conn = pymysql.connect(**kwargs)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{self._db_name_val}` "
+                    f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+            conn.commit()
+            log.info("MySQL : base '%s' prête.", self._db_name_val)
+        finally:
+            conn.close()
 
     def connect(self) -> None:
-        self._conn = psycopg.connect(self.dsn, autocommit=False)
+        kwargs = _parse_dsn(self.dsn)
+        self._conn = pymysql.connect(**kwargs)
+        self._conn.autocommit(False)
+        log.info("MySQL connecté : %s", self.dsn)
 
     def disconnect(self) -> None:
-        if self._conn and not self._conn.closed:
+        if self._conn and self._conn.open:
             self._conn.close()
 
     def setup(self) -> None:
-        """Recrée la table cible (DROP + CREATE) en autocommit."""
+        """Recrée la table cible (DROP + CREATE)."""
         ddl = f"""
-        CREATE TABLE IF NOT EXISTS {TABLE} (
+        CREATE TABLE IF NOT EXISTS `{TABLE}` (
             siret               VARCHAR(14),
             date_debut          DATE,
             date_fin            DATE,
@@ -113,75 +143,211 @@ class PostgresConnector(DBConnector):
             enseigne1           TEXT,
             activite_principale VARCHAR(10),
             caractere_employeur VARCHAR(1)
-        )
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """
-        self._conn.autocommit = True
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
-                cur.execute(ddl)
-        finally:
-            self._conn.autocommit = False
+        with self._conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{TABLE}`")
+            cur.execute(ddl)
+        # DDL MySQL implicitement commité — pas de commit() nécessaire
 
     def teardown(self) -> None:
-        self._conn.autocommit = True
+        with self._conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{TABLE}`")
+
+    def get_version(self) -> str:
+        """Retourne la version MySQL/MariaDB (ex: 'MySQL 8.0.35')."""
         try:
             with self._conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
+                cur.execute("SELECT VERSION()")
+                row = cur.fetchone()
+            return f"MySQL {row[0]}" if row else ""
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------
+    # Opérations vectorielles — MyVector plugin
+    # ------------------------------------------------------------------
+    # Prérequis : plugin MyVector installé sur le serveur MySQL 8.x
+    # Image Docker : ghcr.io/askdba/myvector:mysql-8.4
+    #
+    # API MyVector :
+    #   - Colonne VARBINARY avec COMMENT 'MYVECTOR(type=HNSW,dim=N,...)'
+    #   - MYVECTOR_CONSTRUCT('[v1,v2,...]')  → bytes pour INSERT
+    #   - myvector_distance(vec1, vec2)      → distance L2
+    #   - CALL mysql.myvector_index_build()  → construit l'index HNSW
+    #   - MYVECTOR_IS_ANN(...)               → recherche ANN
+    # ------------------------------------------------------------------
+
+    has_vector_support = True
+    VECTOR_TABLE  = "insee_vecteurs"
+    _db_name_val  = None   # initialisé dans __init__ via _db_name_val
+
+    def _myvector_check(self) -> bool:
+        """Vérifie que le plugin MyVector est disponible."""
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT myvector_construct('[0.0]')")
+                cur.fetchone()
+            return True
+        except Exception:
+            log.warning(
+                "MyVector non disponible — benchmark vectoriel ignoré.\n"
+                "  → Utiliser l'image Docker ghcr.io/askdba/myvector:mysql-8.4"
+            )
+            return False
+
+    def vector_setup(self) -> None:
+        """Crée la table vectorielle MyVector."""
+        if not self._myvector_check():
+            raise RuntimeError("MyVector absent — benchmark vectoriel ignoré.")
+
+        varbinary_size = self.VECTOR_DIM * 4 + 8   # 4 bytes/float + overhead
+        ddl = f"""
+        CREATE TABLE IF NOT EXISTS `{self.VECTOR_TABLE}` (
+            id        INT AUTO_INCREMENT PRIMARY KEY,
+            siret     VARCHAR(14),
+            embedding VARBINARY({varbinary_size})
+            COMMENT 'MYVECTOR(type=HNSW,dim={self.VECTOR_DIM},size=2000000,dist=L2)'
+        ) ENGINE=InnoDB
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{self.VECTOR_TABLE}`")
+            cur.execute(ddl)
+        log.info("MyVector : table '%s' créée (dim=%d).", self.VECTOR_TABLE, self.VECTOR_DIM)
+
+    def vector_teardown(self) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS `{self.VECTOR_TABLE}`")
+
+    def vector_insert(self, n_rows: int) -> float:
+        """Insertion via MYVECTOR_CONSTRUCT() — convertit JSON string → bytes."""
+        vecs = self.generate_vectors(n_rows)
+        sql  = (
+            f"INSERT INTO `{self.VECTOR_TABLE}` (siret, embedding) "
+            f"VALUES (%s, MYVECTOR_CONSTRUCT(%s))"
+        )
+        records = [
+            (f"{i:014d}", "[" + ",".join(f"{v:.6f}" for v in vec) + "]")
+            for i, vec in enumerate(vecs)
+        ]
+        t0 = time.perf_counter()
+        with self._conn.cursor() as cur:
+            cur.executemany(sql, records)
+        self._conn.commit()
+        return time.perf_counter() - t0
+
+    def vector_search_exact(self, n_rows: int, k: int = 10) -> float:
+        """Recherche exacte via myvector_distance() — scan séquentiel."""
+        query_vec = self.generate_vectors(1)[0]
+        vec_str   = "[" + ",".join(f"{v:.6f}" for v in query_vec) + "]"
+        t0 = time.perf_counter()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT siret, myvector_distance(embedding, MYVECTOR_CONSTRUCT(%s)) AS dist "
+                f"FROM `{self.VECTOR_TABLE}` ORDER BY dist LIMIT %s",
+                (vec_str, k),
+            )
+            cur.fetchall()
+        return time.perf_counter() - t0
+
+    def vector_search_approx(self, n_rows: int, k: int = 10) -> float:
+        """
+        Recherche ANN via MYVECTOR_IS_ANN() après construction de l'index HNSW.
+        L'index est construit avant la mesure (hors temps).
+        """
+        # Construire l'index HNSW (hors mesure)
+        db = self._db_name_val or "db_cutoff"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    f"CALL mysql.myvector_index_build("
+                    f"'{db}.{self.VECTOR_TABLE}.embedding', 'id')"
+                )
+        except Exception as e:
+            log.warning("myvector_index_build : %s", e)
+
+        query_vec = self.generate_vectors(1)[0]
+        vec_str   = "[" + ",".join(f"{v:.6f}" for v in query_vec) + "]"
+        t0 = time.perf_counter()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT siret, myvector_row_distance() AS dist "
+                f"FROM `{self.VECTOR_TABLE}` "
+                f"WHERE MYVECTOR_IS_ANN('{db}.{self.VECTOR_TABLE}.embedding', 'id', "
+                f"MYVECTOR_CONSTRUCT(%s), %s)",
+                (vec_str, k),
+            )
+            cur.fetchall()
+        return time.perf_counter() - t0
+
+    def drop_database(self) -> None:
+        """Supprime la base entière après le benchmark."""
+        kwargs = _parse_dsn(self.dsn)
+        kwargs.pop("db", None)
+
+        conn = pymysql.connect(**kwargs)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP DATABASE IF EXISTS `{self._db_name_val}`")
+            conn.commit()
+            log.info("MySQL : base '%s' supprimée.", self._db_name_val)
         finally:
-            self._conn.autocommit = False
+            conn.close()
 
     # ------------------------------------------------------------------
     # Helpers internes
     # ------------------------------------------------------------------
 
+    def _index_exists(self, index_name: str) -> bool:
+        """Vérifie l'existence d'un index via information_schema — compatible toutes versions."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT 1 FROM information_schema.STATISTICS
+                   WHERE table_schema = DATABASE()
+                   AND table_name = %s
+                   AND index_name  = %s
+                   LIMIT 1""",
+                (TABLE, index_name),
+            )
+            return cur.fetchone() is not None
+
     def _drop_index(self) -> None:
         """
-        Supprime tous les index de benchmark.
-        psycopg v3 ouvre une transaction implicite dès le premier SELECT —
-        il faut commiter avant de passer en autocommit, sinon psycopg lève
-        "can't change autocommit now: connection in transaction status INTRANS".
+        Supprime les index de benchmark.
+        Utilise information_schema pour vérifier l'existence avant le DROP —
+        évite l'erreur de syntaxe sur MySQL < 8.0.16 qui ne supporte pas
+        DROP INDEX IF EXISTS.
         """
-        self._conn.commit()           # clôture toute transaction en cours
-        self._conn.autocommit = True
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(f"DROP INDEX IF EXISTS idx_{TABLE}_{INDEX_COL}")
-                cur.execute(f"DROP INDEX IF EXISTS idx_{TABLE}_{INDEX_FILTER_COL}")
-        finally:
-            self._conn.autocommit = False
+        with self._conn.cursor() as cur:
+            for col in [INDEX_COL, INDEX_FILTER_COL]:
+                idx = f"idx_{TABLE}_{col}"
+                if self._index_exists(idx):
+                    cur.execute(f"DROP INDEX `{idx}` ON `{TABLE}`")
 
     def _create_index(self) -> None:
         """
-        Crée deux index :
+        Crée deux index si absents :
         - idx sur siret               → lookup par identifiant
         - idx sur etat_administratif  → filtre sur valeur minoritaire (F)
-        Même contrainte que _drop_index : commit avant autocommit.
+        Même logique : vérification via information_schema pour compatibilité
+        avec MySQL < 8.0.16 qui ne supporte pas CREATE INDEX IF NOT EXISTS.
         """
-        self._conn.commit()           # clôture toute transaction en cours
-        self._conn.autocommit = True
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{TABLE}_{INDEX_COL}"
-                    f" ON {TABLE}({INDEX_COL})"
-                )
-                cur.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{TABLE}_{INDEX_FILTER_COL}"
-                    f" ON {TABLE}({INDEX_FILTER_COL})"
-                )
-        finally:
-            self._conn.autocommit = False
+        with self._conn.cursor() as cur:
+            for col in [INDEX_COL, INDEX_FILTER_COL]:
+                idx = f"idx_{TABLE}_{col}"
+                if not self._index_exists(idx):
+                    cur.execute(
+                        f"CREATE INDEX `{idx}` ON `{TABLE}` (`{col}`)"
+                    )
 
     def _truncate(self) -> None:
         """
-        DELETE FROM au lieu de TRUNCATE.
-        TRUNCATE acquiert un AccessExclusiveLock qui entre en deadlock
-        avec DROP INDEX dans la même transaction.
+        TRUNCATE TABLE sous MySQL/InnoDB.
+        Pas de conflit de verrous avec les index (comportement différent
+        de PostgreSQL) — TRUNCATE est safe ici.
         """
         with self._conn.cursor() as cur:
-            cur.execute(f"DELETE FROM {TABLE}")
-        self._conn.commit()
+            cur.execute(f"TRUNCATE TABLE `{TABLE}`")
 
     @staticmethod
     def _df_to_records(df: pd.DataFrame) -> list[tuple]:
@@ -196,15 +362,17 @@ class PostgresConnector(DBConnector):
     # ------------------------------------------------------------------
 
     def write_bulk(self, df: pd.DataFrame) -> float:
-        """Insertion via protocole COPY (psycopg v3) — méthode la plus rapide."""
+        """
+        Insertion en lot via executemany().
+        MySQL ne dispose pas de protocole COPY — executemany() est
+        la méthode la plus rapide disponible avec pymysql.
+        """
         self._truncate()
         self._drop_index()
         records = self._df_to_records(df)
         t0 = time.perf_counter()
         with self._conn.cursor() as cur:
-            with cur.copy(COPY_SQL) as copy:
-                for record in records:
-                    copy.write_row(record)
+            cur.executemany(INSERT_SQL, records)
         self._conn.commit()
         return time.perf_counter() - t0
 
@@ -224,7 +392,7 @@ class PostgresConnector(DBConnector):
         self._drop_index()
         t0 = time.perf_counter()
         with self._conn.cursor() as cur:
-            cur.execute(f"SELECT * FROM {TABLE} LIMIT %s", (n_rows,))
+            cur.execute(f"SELECT * FROM `{TABLE}` LIMIT %s", (n_rows,))
             cur.fetchall()
         return time.perf_counter() - t0
 
@@ -233,7 +401,8 @@ class PostgresConnector(DBConnector):
         t0 = time.perf_counter()
         with self._conn.cursor() as cur:
             cur.execute(
-                f"SELECT * FROM {TABLE} WHERE etat_administratif = %s LIMIT %s",
+                f"SELECT * FROM `{TABLE}` "
+                f"WHERE etat_administratif = %s LIMIT %s",
                 (FILTER_VAL, n_rows),
             )
             cur.fetchall()
@@ -243,7 +412,7 @@ class PostgresConnector(DBConnector):
         self._create_index()
         t0 = time.perf_counter()
         with self._conn.cursor() as cur:
-            cur.execute(f"SELECT * FROM {TABLE} LIMIT %s", (n_rows,))
+            cur.execute(f"SELECT * FROM `{TABLE}` LIMIT %s", (n_rows,))
             cur.fetchall()
         return time.perf_counter() - t0
 
@@ -252,37 +421,9 @@ class PostgresConnector(DBConnector):
         t0 = time.perf_counter()
         with self._conn.cursor() as cur:
             cur.execute(
-                f"SELECT * FROM {TABLE} WHERE etat_administratif = %s LIMIT %s",
+                f"SELECT * FROM `{TABLE}` "
+                f"WHERE etat_administratif = %s LIMIT %s",
                 (FILTER_VAL, n_rows),
             )
             cur.fetchall()
         return time.perf_counter() - t0
-
-    def drop_database(self) -> None:
-        """
-        Supprime la base cible après le benchmark.
-        Connexion à 'postgres' en autocommit (DROP DATABASE interdit
-        en transaction et impossible si connecté à la base cible).
-        """
-        db_name = _db_name(self.dsn)
-        sys_dsn = _system_dsn(self.dsn)
-
-        with psycopg.connect(sys_dsn, autocommit=True) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM pg_database WHERE datname = %s", (db_name,)
-            ).fetchone()
-
-            if row is not None:
-                # Forcer la déconnexion des sessions actives avant DROP
-                conn.execute(
-                    """
-                    SELECT pg_terminate_backend(pid)
-                    FROM pg_stat_activity
-                    WHERE datname = %s AND pid <> pg_backend_pid()
-                    """,
-                    (db_name,),
-                )
-                conn.execute(f'DROP DATABASE "{db_name}"')
-                log.info("Base '%s' supprimée.", db_name)
-            else:
-                log.warning("Base '%s' introuvable — rien à supprimer.", db_name)
