@@ -1,0 +1,40 @@
+# Schéma GraphQL commun — DB Benchmarker
+# Contrat entre le serveur de test et tous les sidecars.
+# Chaque sidecar MUST implémenter l'intégralité de ce schéma.
+
+type Record {
+  id:   String!
+  data: JSON!
+}
+
+type BulkResult {
+  inserted: Int!
+  errors:   Int!
+}
+
+type Query {
+  # R1 — lecture par identifiant unique
+  getById(id: String!): Record
+
+  # R2/R3 — lecture filtrée (champ + valeur)
+  filter(field: String!, value: String!, limit: Int): [Record!]!
+
+  # R4 — comptage global
+  count: Int!
+
+  # Recherche full-text (SHOULD)
+  search(query: String!, limit: Int): [Record!]!
+}
+
+type Mutation {
+  # W2 — insertion unitaire
+  insertOne(data: JSON!): Boolean!
+
+  # W1 — insertion en masse
+  insertBulk(data: [JSON!]!): BulkResult!
+
+  # Remise à zéro avant test
+  truncate: Boolean!
+}
+
+scalar JSON

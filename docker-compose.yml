@@ -1,0 +1,223 @@
+# =============================================================================
+# DB Cutoff Analyzer — Docker Compose
+# =============================================================================
+# Usage :
+#   docker compose up -d                        # tous les containers
+#   docker compose up -d postgres mysql         # sélection
+#   docker compose logs --tail=50 <container>   # logs
+#   docker compose stop                         # arrêt (données conservées)
+#   docker compose down -v                      # arrêt + suppression volumes
+#
+# Variables d'environnement : copier .env.example en .env et ajuster les valeurs
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 17 + pgvector
+  # Port 5433 (hors standard pour éviter les conflits avec une instance locale)
+  # Activation requise en base : CREATE EXTENSION IF NOT EXISTS vector;
+  # DSN : postgresql://postgres:Cheek0-Likely7@localhost:5433/db_cutoff
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: dbcutoff_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: Cheek0-Likely7
+      POSTGRES_DB:       db_cutoff
+    ports:
+      - "5532:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MySQL 9.2
+  # Type VECTOR(dim) natif — PAS de fonction de distance en Community
+  # Tests vectoriels désactivés (has_vector_support = False dans le connecteur)
+  # DSN : mysql+pymysql://root:Cheek0-Likely7@localhost:3306/db_cutoff
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:9.2
+    container_name: dbcutoff_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: Cheek0-Likely7
+      MYSQL_DATABASE: db_cutoff
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pCheek0-Likely7"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MariaDB 11.8 LTS
+  # VECTOR(n) natif + index HNSW (MHNSW) + VEC_DISTANCE_EUCLIDEAN()
+  # Compatible pymysql — batterie de tests complète y compris vectoriel
+  # DSN : mysql+pymysql://root:Cheek0-Likely7@localhost:3307/db_cutoff
+  # ---------------------------------------------------------------------------
+  mariadb:
+    image: mariadb:11.8
+    container_name: dbcutoff_mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: Cheek0-Likely7
+      MARIADB_DATABASE: db_cutoff
+    ports:
+      - "3307:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MongoDB 8
+  # Vector search via agrégation ($vectorSearch requiert Atlas en production)
+  # En mode standalone : recherche exacte uniquement
+  # DSN : mongodb://postgres:Cheek0-Likely7@localhost:27017/db_cutoff?directConnection=true&authSource=admin
+  # ---------------------------------------------------------------------------
+  mongodb:
+    image: mongo:8
+    container_name: dbcutoff_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: postgres
+      MONGO_INITDB_ROOT_PASSWORD: Cheek0-Likely7
+      MONGO_INITDB_DATABASE:      db_cutoff
+    ports:
+      - "27117:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval",
+             "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # CouchDB 3
+  # API REST / index Mango — pas de support vectoriel natif
+  # DSN : http://postgres:Cheek0-Likely7@localhost:5984/db_cutoff
+  # Initialisation requise au premier démarrage :
+  #   curl -X PUT http://postgres:Cheek0-Likely7@localhost:5984/_users
+  #   curl -X PUT http://postgres:Cheek0-Likely7@localhost:5984/_replicator
+  # ---------------------------------------------------------------------------
+  couchdb:
+    image: couchdb:3
+    container_name: dbcutoff_couchdb
+    restart: unless-stopped
+    environment:
+      COUCHDB_USER:     postgres
+      COUCHDB_PASSWORD: Cheek0-Likely7
+    ports:
+      - "5985:5984"
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5984/_up"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # ArangoDB 3.12
+  # Multi-modèle : document, graphe, clé-valeur
+  # Interface web : http://localhost:8529  (root / Cheek0-Likely7)
+  # DSN : http://root:Cheek0-Likely7@localhost:8529/db_cutoff
+  # Support vectoriel : Enterprise uniquement
+  # ---------------------------------------------------------------------------
+  arangodb:
+    image: arangodb:3.12
+    container_name: dbcutoff_arangodb
+    restart: unless-stopped
+    environment:
+      ARANGO_ROOT_PASSWORD: Cheek0-Likely7
+    ports:
+      - "8529:8529"
+    volumes:
+      - arango_data:/var/lib/arangodb3
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8529/_api/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # CrateDB 5
+  # SQL distribué sur architecture colonnaire — compatible PostgreSQL wire protocol
+  # Interface web : http://localhost:4200  (pas d'authentification par défaut)
+  # DSN : crate://localhost:5432/db_cutoff  (via psycopg2 / crate[crate])
+  # Support vectoriel : FLOAT_VECTOR natif + KNN via <#> (cosine) depuis 5.5
+  # Mémoire : heap JVM limité à 1g — ajuster CRATE_HEAP_SIZE si besoin
+  # ---------------------------------------------------------------------------
+  cratedb:
+    image: crate:latest
+    container_name: dbcutoff_cratedb
+    restart: unless-stopped
+    environment:
+      CRATE_HEAP_SIZE: 1g
+    ports:
+      - "4200:4200"   # Admin UI + HTTP API
+      - "5435:5432"   # PostgreSQL wire protocol
+    volumes:
+      - cratedb_data:/data
+    command: >
+      crate
+      -Cdiscovery.type=single-node
+      -Cnetwork.host=0.0.0.0
+      -Cauth.host_based.enabled=false
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4200/_cluster/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Valkey 8
+  # Fork open source de Redis (licence BSD) — structures de données en mémoire
+  # Protocole RESP3 — compatible redis-py / valkey-py
+  # DSN : redis://localhost:6379/0  (valkey-py accepte le préfixe redis://)
+  # Persistance : AOF activé (appendonly yes) — snapshot RDB toutes les 60s
+  # Support vectoriel : module RediSearch/VectorSimilarity non inclus dans l'image officielle
+  # ---------------------------------------------------------------------------
+  valkey:
+    image: valkey/valkey:latest
+    container_name: dbcutoff_valkey
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+    command: valkey-server --appendonly yes --save 60 1
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# -----------------------------------------------------------------------------
+# Volumes nommés — persistance des données entre redémarrages
+# -----------------------------------------------------------------------------
+volumes:
+  postgres_data:
+  mysql_data:
+  mariadb_data:
+  mongo_data:
+  couchdb_data:
+  arango_data:
+  cratedb_data:
+  valkey_data:
